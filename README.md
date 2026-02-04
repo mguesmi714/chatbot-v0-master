@@ -2,10 +2,10 @@
 
 Prototype de chatbot **full-stack** :
 - **Frontend** : Next.js (React + TypeScript + Tailwind)
-- **Backend** : FastAPI (Python) + Agent IA (OpenAI)
-- (Bientôt) RAG : LlamaIndex + Qdrant
-- (Bientôt) Mémoire : Redis / Postgres
-- (Bientôt) Actions : Make / APIs internes.
+- **Backend** : FastAPI (Python) + OpenAI
+- **RAG CSV intégré** (FAQ depuis backend/QR_clean.csv) avec fallback LLM
+- **Multilingue FR/EN/AR** (détection auto + forçage UI)
+- (Bientôt) Mémoire : Redis / Postgres • (Bientôt) Actions : Make / APIs internes.
 
 ---
 
@@ -27,15 +27,11 @@ Cette section documente précisément les points clés du repo pour que vous pui
 
 ### 1) Multilingue intelligent (FR/EN/AR)
 
-- Détection automatique de la langue via LLM côté backend (fr | en | ar), avec repli simple si nécessaire.
-  - Implémentation: [backend/main.py](backend/main.py)
-  - Fonctions clés:
-    - `normalize_lang()` / `detect_language()` pour la normalisation et repli simple
-    - `llm_detect_language(text)` pour la détection par modèle
-    - Dictionnaires `I18N` et `LANG_NAMES` pour les messages localisés
-- Réponses du bot toujours dans la langue choisie/détectée
-  - Une consigne “system” est ajoutée aux messages OpenAI pour forcer la langue et ne pas traduire les données sensibles (noms, numéros, dates)
-- Sélection manuelle possible via le frontend (select FR/EN/AR) ou en envoyant un message `FR`/`EN`/`AR`.
+- Détection auto (fr | en | ar) côté backend: heuristique rapide puis LLM optionnel.
+  - Implémentation: [backend/language_detection.py](backend/language_detection.py)
+  - Fonctions clés: `_heuristic_lang(text)`, `normalize_lang(s)`, `llm_detect_language(text)`
+- Le backend renvoie `lang` pour chaque réponse; le frontend s’aligne si aucune langue n’a été forcée.
+- Sélection manuelle disponible via le sélecteur FR/EN/AR dans l’UI.
 
 Frontend (UI localisée + RTL arabe):
 - Sélecteur de langue, greeting, labels, boutons, placeholders, titres des pièces jointes localisés
@@ -53,7 +49,7 @@ Frontend (UI localisée + RTL arabe):
   - `prescription_file`, `insurance_file`: fichiers optionnels (PDF / image)
 - Implémentation côté UI: [frontend/app/page.tsx](frontend/app/page.tsx)
 
-### 2.1) RAG Q/R (FAQ csv) — comment ça marche
+### 2.1) RAG Q/R (CSV) + fallback LLM — comment ça marche
 
 Objectif: permettre au bot de répondre à partir d’un fichier CSV de questions/réponses (FAQ interne), en FR/EN/AR.
 
@@ -68,15 +64,12 @@ Endpoints RAG
 - `GET /rag/status` → `{ count, config_path, loaded_path }`
 - `POST /rag/clean` → nettoie `QR.csv` en `QR_clean.csv` + recharge; renvoie `{ ok, src, dst, count, reloaded }`
 - `POST /rag/reload` → recharge l’index (facultatif, avec `?path=...`)
-- `POST /rag/ask` → répond uniquement depuis le CSV. Form-data: `q` (question), `language` (optionnel: `fr|en|ar`). Retour: `{ answer, matched_question, lang }`
-- `GET /rag/debug?q=...` → debug: montre les meilleurs matchs lexicaux (scores + Q/A)
+- `POST /rag/ask` (Form) → répond depuis le CSV; avec `fallback=true`, le LLM est utilisé si rien n’est trouvé. Champs: `q`, `language?`, `fallback?`. Retour: `{ answer, matched_question, lang, found, used_fallback }`
+- `GET /rag/debug?q=...` → debug: meilleurs matchs lexicaux (scores + Q/A)
 
 Stratégie de recherche (retrieval)
-- Chemin rapide (exact/proche): si la question de l’utilisateur correspond de très près à une Q du CSV, on renvoie directement la réponse du CSV (sans appeler le LLM). Similarité lexicale normalisée (accents retirés), seuil ≈ 0.85 + boost sur sous‑chaîne/exact.
-- Sinon: récupération hybride
-  - Embeddings calculés à la demande (pas au démarrage) pour question et documents;
-  - Repli lexical rapide si l’API d’embeddings n’est pas disponible.
-- Les meilleurs extraits (Q/A) sont ensuite injectés dans le contexte du LLM si besoin.
+- Chemin rapide (exact/proche): score lexical élevé → réponse CSV directe (sans LLM).
+- Sinon: si `fallback=true` → génération LLM (dans la langue cible), éventuellement avec contexte minimal.
 
 Langue des réponses
 - La langue de réponse est strictement celle de la session (FR/EN/AR). Si la réponse CSV est en FR et la session en EN/AR, elle est traduite automatiquement avant affichage (noms/numéros/dates non traduits).
@@ -98,12 +91,12 @@ Bonnes pratiques CSV
 ### 3) Endpoints FastAPI
 
 - `GET /health` → simple statut
-- `POST /chat` → logique principale du chatbot (flow location + fallback IA)
+- `POST /chat` → logique principale (intents + RAG‑first + fallback LLM)
   - Paramètres `Form`: `messages`, `session_id`, `language`
   - Paramètres `File`: `prescription_file`, `insurance_file`
   - Réponse: `{ reply: string, session_id: string }`
 - `GET /lang/detect?text=...` → helper dev: renvoie `{ language: fr|en|ar }`
-- `POST /rag/ask` → répond depuis la base CSV (voir 2.1)
+- `POST /rag/ask` → répond depuis CSV, et bascule sur LLM si `fallback=true` (voir 2.1)
 - `GET /rag/debug` → diagnostic matching (voir 2.1)
 - CORS: autorise http://localhost:3000
 - Implémentation: [backend/main.py](backend/main.py)
@@ -114,9 +107,9 @@ Bonnes pratiques CSV
   - Dans les actions rapides (à côté de Bonjour/Location/Ordonnance)
   - Dans l’entête du slot “Ordonnance” (quand la section PJ est visible)
 - Comportement:
-  1. Au clic, le bot affiche un prompt localisé (FR/EN/AR): “Comment puis-je vous aider ? …”
-  2. Les messages suivants sont routés vers `POST /rag/ask` et répondus uniquement depuis la base CSV (RAG). Pas d’appel LLM.
-  3. Le mode se désactive si vous lancez la “Location” ou si vous faites “Réinitialiser”.
+  1. Au clic, l’UI affiche un prompt localisé (FR/EN/AR).
+  2. Les messages suivants vont vers `POST /rag/ask` avec `fallback=true`: RAG d’abord, LLM sinon.
+  3. Le mode se désactive si vous lancez “Location/Renouvellement/Retour” ou “Réinitialiser”.
 - La langue UI est envoyée à `/rag/ask` pour obtenir une réponse traduite si `RAG_TRANSLATE=true`.
 
 ### 4) Sessions et mémoire en RAM
@@ -317,6 +310,12 @@ Format de réponse :
 
 ---
 
+TL;DR RAG vs LLM
+- Mode normal (`POST /chat`) : RAG‑first interne, puis LLM avec contexte si nécessaire.
+- Mode Question/Aide (`POST /rag/ask` + `fallback=true`) : RAG‑first CSV, puis LLM si pas de match.
+
+---
+
 ## 🧪 Test manuel rapide
 
 1) Lance backend + frontend  
@@ -404,7 +403,7 @@ Backend
 Frontend
 - Ajout du mode “Question/Aide”:
   - Bouton dans les actions rapides et à côté d’“Ordonnance”.
-  - Prompt “Comment puis-je vous aider ?” puis réponses via `/rag/ask` (CSV only).
+  - Prompt “Comment puis-je vous aider ?” puis réponses via `/rag/ask` avec `fallback=true` (RAG d’abord, LLM sinon).
   - Sortie du mode à la “Location” ou “Réinitialiser”.
 - Envoi de la langue UI vers `/rag/ask` pour répondre dans la langue choisie.
 - Bouton “Question/Aide” cliquable même sans texte saisi.
