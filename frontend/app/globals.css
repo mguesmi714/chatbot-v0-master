@@ -1,0 +1,57 @@
+@import "tailwindcss";
+
+:root {
+  --primary-blue:#5FA7DC;
+  --primary-blue-2:#4A90C5;
+  --accent-orange:#E8A212;
+
+  --bg-page:
+    radial-gradient(1200px 700px at 18% 10%, rgba(95,167,220,.25), transparent 55%),
+    radial-gradient(900px 600px at 90% 18%, rgba(232,162,18,.18), transparent 60%),
+    radial-gradient(1100px 700px at 50% 95%, rgba(95,167,220,.18), transparent 55%),
+    linear-gradient(180deg, #F6FAFE 0%, #F2F7FC 100%);
+
+  --surface: rgba(255,255,255,.78);
+  --surface-strong: rgba(255,255,255,.92);
+  --surface-border: rgba(255,255,255,.55);
+
+  --text-dark:#203040;
+  --text-muted:#64748B;
+  --text-white:#fff;
+
+  --shadow-soft: 0 16px 40px rgba(19, 54, 84, .18);
+  --shadow-float: 0 18px 55px rgba(95,167,220,.28);
+  --shadow-press: 0 10px 20px rgba(19, 54, 84, .14);
+
+  --r-xl: 26px;
+  --r-lg: 20px;
+  --r-md: 14px;
+  --r-pill: 999px;
+
+  --ring: 0 0 0 4px rgba(95,167,220,.16);
+
+  /* Chat tokens */
+  --chat-header-gradient: linear-gradient(135deg, var(--primary-blue), var(--primary-blue-2));
+  --chat-user-bubble: linear-gradient(135deg, var(--primary-blue), var(--primary-blue-2));
+  --chat-bot-bubble: rgba(239,246,251,.92);
+  --chat-bot-border: rgba(95,167,220,.18);
+  --chat-panel: linear-gradient(180deg, rgba(255,255,255,.82), rgba(255,255,255,.70));
+  --chat-body-bg:
+    radial-gradient(900px 500px at 20% 0%, rgba(95,167,220,.10), transparent 60%),
+    radial-gradient(900px 500px at 100% 30%, rgba(232,162,18,.08), transparent 55%),
+    linear-gradient(180deg, rgba(255,255,255,.55), rgba(255,255,255,.35));
+
+  --brand-gradient: linear-gradient(135deg, var(--accent-orange), #F0B02C);
+}
+
+/* Inline theme mapping removed; we use explicit CSS variables above */
+
+/* No dark theme override for this bright design */
+
+body {
+  background: var(--bg-page);
+  color: var(--text-dark);
+  font-family: var(--font-geist-sans), ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, "Apple Color Emoji", "Segoe UI Emoji";
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}

@@ -1,0 +1,42 @@
+# --- OS ---
+.DS_Store
+Thumbs.db
+
+# --- IntelliJ / JetBrains ---
+.idea/
+*.iml
+
+# --- Node / Next.js ---
+node_modules/
+.next/
+out/
+dist/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Environment files (IMPORTANT: no secrets in git) ---
+.env
+.env.*
+!.env.example
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+*.egg-info/
+
+# --- Logs ---
+*.log
+
+# --- Coverage ---
+coverage/
