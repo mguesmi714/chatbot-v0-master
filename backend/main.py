@@ -53,6 +53,9 @@ class ChatResponse(BaseModel):
     lang: str = "fr"
     intent: Optional[str] = None
     attachments: Optional[list[str]] = None
+    # Optional confirmation flow payload
+    confirm: bool = False
+    summary: Optional[dict] = None
 
 # Health
 @app.get("/health")
@@ -281,12 +284,9 @@ async def chat(
     if state.get("stage") == "asked_confirm":
         prev_intent = state.get("intent")
         if _is_affirmative(user_text):
-            SESSION_STATE[sid] = {"intent": prev_intent, "stage": "awaiting_details"}
-            if prev_intent == "rent":
-                msg = "Merci de m'envoyer vos donnees en une seule reponse :\n\nNom, Prenom, Date debut (ex: 22/01/2026), Date fin (ex: 29/01/2026), Code postal\n\nEt les 2 fichiers a mettre (PDF ou image) : Ordonnance + Carte mutuelle" if lang == "fr" else ("Please send me your information in a single response:\n\nLast name, First name, Start date (e.g. 22/01/2026), End date (e.g. 29/01/2026), Postal code\n\nAnd the 2 files (PDF or image): Prescription + Insurance card" if lang == "en" else "يرجى إرسال معلوماتك في رد واحد:\n\nاللقب، الاسم الأول، تاريخ البدء (مثال: 22/01/2026)، تاريخ النهاية (مثال: 29/01/2026)، الرمز البريدي\n\nوالملفان (PDF أو صورة): الوصفة + بطاقة التأمين")
-            elif prev_intent == "renew":
-                msg = "Merci de m'envoyer vos donnees en une seule reponse :\n\nNom, Prenom, Date debut (ex: 22/01/2026), Date fin (ex: 29/01/2026), Code postal\n\nEt les 2 fichiers a mettre (PDF ou image) : Ordonnance + Carte mutuelle" if lang == "fr" else ("Please send me your information in a single response:\n\nLast name, First name, Start date (e.g. 22/01/2026), End date (e.g. 29/01/2026), Postal code\n\nAnd the 2 files (PDF or image): Prescription + Insurance card" if lang == "en" else "يرجى إرسال معلوماتك في رد واحد:\n\nاللقب، الاسم الأول، تاريخ البدء (مثال: 22/01/2026)، تاريخ النهاية (مثال: 29/01/2026)، الرمز البريدي\n\nوالملفان (PDF أو صورة): الوصفة + بطاقة التأمين")
-            else:
+            # Switch to progressive (ligne par ligne) collection immediately
+            SESSION_STATE[sid] = {"intent": prev_intent, "stage": "collect_details", "details": {"name": "", "start_date": "", "end_date": "", "postal_code": "", "attachments": []}}
+            if prev_intent == "return":
                 msg = (
                     "Parfait. Pour le retour, précisez le motif:\n\n• Fin d’utilisation: nous vous envoyons l’étiquette Chronopost. Confirmez votre code postal si besoin.\n• Problème/échange: envoyez EN UNE SEULE réponse: Référence de commande, Photo/vidéo du problème, 'échange' ou 'remboursement', et votre Code postal."
                     if lang == "fr"
@@ -296,6 +296,14 @@ async def chat(
                         else "حسناً. بخصوص الإرجاع، حدِّد السبب:\n\n• انتهاء الاستخدام: سنرسل لك ملصق الشحن (Chronopost). أكِّد الرمز البريدي إن لزم.\n• مشكلة/استبدال: أرسل في رد واحد: مرجع الطلب، صورة/فيديو للمشكلة، 'استبدال' أو 'استرداد'، والرمز البريدي."
                     )
                 )
+            else:
+                # First prompt for progressive flow
+                if lang == "fr":
+                    msg = "Merci. Indiquez Nom, Prénom (ex: Dupont, Marie)"
+                elif lang == "en":
+                    msg = "Thanks. Please provide Last name, First name (e.g., Doe, Jane)"
+                else:
+                    msg = "شكرًا. يرجى إرسال الاسم واللقب (مثال: أحمد، علي)"
             return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=saved_urls or None)
         elif _is_negative(user_text):
             SESSION_STATE.pop(sid, None)
@@ -304,6 +312,223 @@ async def chat(
         else:
             msg = "Pour confirmer, tu veux %s ?" % ("louer un tire-lait" if prev_intent=="rent" else ("renouveler" if prev_intent=="renew" else "retourner")) if lang == "fr" else ("To confirm, do you want to %s ?" % ("rent a breast pump" if prev_intent=="rent" else ("renew" if prev_intent=="renew" else "return")) if lang == "en" else "لتأكيد، هل تريد %s ؟" % ("استئجار شفاط" if prev_intent=="rent" else ("تجديد" if prev_intent=="renew" else "إرجاع")))
             return ChatResponse(reply=msg, session_id=sid, lang=lang)
+
+    # Progressive collection (ligne par ligne)
+    if state.get("stage") == "collect_details":
+        prev_intent = state.get("intent") or intent
+        details = state.get("details") or {"name": "", "start_date": "", "end_date": "", "postal_code": "", "attachments": []}
+        edit_mode = bool(state.get("edit"))
+
+        # Helper parsers
+        def _parse_dates(t: str):
+            ds = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", t)
+            return ds
+
+        def _parse_postal(t: str):
+            m = re.search(r"\b\d{5}\b", t)
+            return m.group(0) if m else ""
+
+        def _parse_name(t: str):
+            # Accept formats: "Nom, Prenom" or two words
+            if "," in t:
+                parts = [p.strip() for p in t.split(",") if p.strip()]
+                if len(parts) >= 2:
+                    return f"{parts[0]} {parts[1]}"
+            parts = [p for p in re.split(r"\s+", t.strip()) if p]
+            if len(parts) >= 2 and len(" ".join(parts)) <= 80:
+                return f"{parts[0]} {parts[1]}"
+            return ""
+
+        # Try to map incoming text to next missing field
+        missing_order = [f for f in ["name", "start_date", "end_date", "postal_code"] if not details.get(f)]
+        filled = False
+
+        # Attachments status for this turn
+        if saved_urls:
+            details["attachments"] = saved_urls
+
+        # If we are in edit mode (user clicked "Modifier"), allow targeted corrections like "Nom: ...", "Date début: ...", "Code postal: 75001"
+        if edit_mode:
+            changed = False
+            lt = (user_text or "").strip()
+            if not lt:
+                # Ask which field to modify
+                msg = (
+                    "D'accord. Quel champ souhaitez-vous corriger ?\nExemples: \n• Nom: Dupont Marie\n• Date début: 22/01/2026\n• Date fin: 29/01/2026\n• Code postal: 69001"
+                    if lang == "fr"
+                    else (
+                        "Okay. Which field would you like to edit?\nExamples:\n• Name: Doe Jane\n• Start date: 22/01/2026\n• End date: 29/01/2026\n• Postal code: 69001"
+                        if lang == "en"
+                        else "حسنًا. ما الحقل الذي تريد تعديله؟\nأمثلة:\n• الاسم: أحمد علي\n• تاريخ البدء: 22/01/2026\n• تاريخ النهاية: 29/01/2026\n• الرمز البريدي: 69001"
+                    )
+                )
+                # Persist state
+                SESSION_STATE[sid] = {"intent": prev_intent, "stage": "collect_details", "details": details, "edit": True}
+                return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=details.get("attachments") or None)
+
+            def _apply_labeled_change(patterns: list[str], key: str, parser=None):
+                nonlocal changed
+                for p in patterns:
+                    m = re.search(rf"(?i)\b{p}\b\s*:\s*(.+)", lt)
+                    if m:
+                        val = m.group(1).strip()
+                        if key in {"start_date", "end_date"}:
+                            ds = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", val)
+                            if ds:
+                                details[key] = ds[0]
+                                changed = True
+                                return
+                        elif key == "postal_code":
+                            pc = re.search(r"\b\d{5}\b", val)
+                            if pc:
+                                details[key] = pc.group(0)
+                                changed = True
+                                return
+                        elif key == "name":
+                            nm = parser(val) if parser else val
+                            if nm:
+                                details[key] = nm
+                                changed = True
+                                return
+                        else:
+                            if val:
+                                details[key] = val
+                                changed = True
+                                return
+
+            _apply_labeled_change(["nom", "name", "الاسم"], "name", _parse_name)
+            _apply_labeled_change(["date début", "date debut", "start date", "تاريخ البدء"], "start_date")
+            _apply_labeled_change(["date fin", "end date", "تاريخ النهاية"], "end_date")
+            _apply_labeled_change(["code postal", "postal code", "الرمز البريدي"], "postal_code")
+
+            # Persist after possible changes
+            SESSION_STATE[sid] = {"intent": prev_intent, "stage": "collect_details", "details": details, "edit": not changed}
+
+            # If nothing recognized, ask again with examples
+            if not changed:
+                msg = (
+                    "Je n'ai pas identifié le champ à corriger. Utilisez par ex.: 'Nom: Dupont Marie' ou 'Date début: 22/01/2026' ou 'Code postal: 69001'."
+                    if lang == "fr"
+                    else (
+                        "I couldn't detect which field to edit. Use e.g.: 'Name: Doe Jane' or 'Start date: 22/01/2026' or 'Postal code: 69001'."
+                        if lang == "en"
+                        else "لم أتعرف على الحقل المراد تعديله. استخدم مثلًا: 'الاسم: أحمد علي' أو 'تاريخ البدء: 22/01/2026' أو 'الرمز البريدي: 69001'."
+                    )
+                )
+                return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=details.get("attachments") or None)
+
+        if missing_order:
+            nxt = missing_order[0]
+            if nxt == "name":
+                guess = _parse_name(user_text)
+                if guess:
+                    details["name"] = guess
+                    filled = True
+            elif nxt == "start_date":
+                ds = _parse_dates(user_text)
+                if ds:
+                    details["start_date"] = ds[0]
+                    # If two dates in one line, take second as end_date
+                    if len(ds) >= 2 and not details.get("end_date"):
+                        details["end_date"] = ds[1]
+                    filled = True
+            elif nxt == "end_date":
+                ds = _parse_dates(user_text)
+                if ds:
+                    # Take last date as end_date if any
+                    details["end_date"] = ds[-1]
+                    filled = True
+            elif nxt == "postal_code":
+                pc = _parse_postal(user_text)
+                if pc:
+                    details["postal_code"] = pc
+                    filled = True
+
+        # Persist details
+        SESSION_STATE[sid] = {"intent": prev_intent, "stage": "collect_details", "details": details}
+
+        # Check completion
+        need_attachments = (prev_intent in {"rent", "renew"})
+        have_all_fields = all(details.get(k) for k in ["name", "start_date", "end_date", "postal_code"]) and ((len(details.get("attachments", [])) >= 2) if need_attachments else True)
+
+        if have_all_fields:
+            # Build summary and confirm
+            summary = {
+                "name": details.get("name", ""),
+                "start_date": details.get("start_date", ""),
+                "end_date": details.get("end_date", ""),
+                "postal_code": details.get("postal_code", ""),
+                "attachments": details.get("attachments", []),
+            }
+            SESSION_STATE[sid] = {"intent": prev_intent, "stage": "confirm_summary", "details": summary}
+            if lang == "fr":
+                msg = (
+                    "Merci. Voici votre récapitulatif:\n"
+                    f"• Nom/Prénom: {summary['name']}\n"
+                    f"• Date début: {summary['start_date']}\n"
+                    f"• Date fin: {summary['end_date']}\n"
+                    f"• Code postal: {summary['postal_code']}\n"
+                    "• PJ: Ordonnance + Carte mutuelle\n\n"
+                    "Confirmer la commande ? (Oui / Non)"
+                )
+            elif lang == "en":
+                msg = (
+                    "Thanks. Here is your summary:\n"
+                    f"• Name: {summary['name']}\n"
+                    f"• Start date: {summary['start_date']}\n"
+                    f"• End date: {summary['end_date']}\n"
+                    f"• Postal code: {summary['postal_code']}\n"
+                    "• Attachments: Prescription + Insurance card\n\n"
+                    "Confirm order? (Yes / No)"
+                )
+            else:
+                msg = (
+                    "شكرًا. هذا الملخص:\n"
+                    f"• الاسم: {summary['name']}\n"
+                    f"• تاريخ البدء: {summary['start_date']}\n"
+                    f"• تاريخ النهاية: {summary['end_date']}\n"
+                    f"• الرمز البريدي: {summary['postal_code']}\n"
+                    "• المرفقات: الوصفة + بطاقة التأمين\n\n"
+                    "تأكيد الطلب؟ (نعم / لا)"
+                )
+            return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=details.get("attachments") or None, confirm=True, summary=summary)
+
+        # Otherwise prompt next field
+        prompts = {
+            "name": {
+                "fr": "Merci. Indiquez Nom, Prénom (ex: Dupont, Marie)",
+                "en": "Thanks. Please provide Last name, First name (e.g., Doe, Jane)",
+                "ar": "شكرًا. يرجى إرسال الاسم واللقب (مثال: أحمد، علي)"
+            },
+            "start_date": {
+                "fr": "Date début (ex: 22/01/2026)",
+                "en": "Start date (e.g., 22/01/2026)",
+                "ar": "تاريخ البدء (مثال: 22/01/2026)"
+            },
+            "end_date": {
+                "fr": "Date fin (ex: 29/01/2026)",
+                "en": "End date (e.g., 29/01/2026)",
+                "ar": "تاريخ النهاية (مثال: 29/01/2026)"
+            },
+            "postal_code": {
+                "fr": "Code postal (5 chiffres)",
+                "en": "Postal code (5 digits)",
+                "ar": "الرمز البريدي (5 أرقام)"
+            },
+            "attachments": {
+                "fr": "Ajoutez les 2 pièces: Ordonnance + Carte mutuelle (PDF ou image)",
+                "en": "Please attach both files: Prescription + Insurance card (PDF or image)",
+                "ar": "يرجى إرفاق ملفين: الوصفة + بطاقة التأمين (PDF أو صورة)"
+            }
+        }
+
+        next_missing = [f for f in ["name", "start_date", "end_date", "postal_code"] if not details.get(f)]
+        if not next_missing and need_attachments and len(details.get("attachments", [])) < 2:
+            key = "attachments"
+        else:
+            key = next_missing[0] if next_missing else "attachments"
+        msg = prompts[key][lang if lang in {"fr","en","ar"} else "fr"]
+        return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=details.get("attachments") or None)
 
     if state.get("stage") == "awaiting_details":
         prev_intent = state.get("intent")
@@ -327,12 +552,70 @@ async def chat(
                     "attachments": "Ordonnance + Carte mutuelle (PDF ou image)" if lang == "fr" else ("Prescription + Insurance card (PDF or image)" if lang == "en" else "الوصفة + بطاقة التأمين (PDF أو صورة)"),
                 }
                 missing_list = ", ".join(field_map.get(m, m) for m in missing)
-                msg = f"Merci, il manque ces informations: {missing_list}. Merci de les envoyer EN UNE SEULE reponse." if lang == "fr" else (f"Thanks, missing info: {missing_list}. Please send them IN A SINGLE reply." if lang == "en" else f"شكرًا، المعلومات المفقودة: {missing_list}. يرجى إرسالها في رد واحد.")
+                if lang == "fr":
+                    msg = f"Merci, il manque ces informations: {missing_list}. Vous pouvez les envoyer EN UNE SEULE réponse, ou bien LIGNE PAR LIGNE.\n\nSi vous préférez: indiquez d'abord Nom/Prénom, puis Date début, Date fin, puis Code postal, et ajoutez les 2 pièces (Ordonnance + Carte mutuelle)."
+                elif lang == "en":
+                    msg = f"Thanks, missing info: {missing_list}. You can send them IN A SINGLE reply, or STEP BY STEP.\n\nIf you prefer: provide Name, then Start date, End date, then Postal code, and attach both files."
+                else:
+                    msg = f"شكرًا، المعلومات المفقودة: {missing_list}. يمكنك إرسالها في رد واحد، أو سطرًا بسطر.\n\nإن رغبت: أرسل الاسم، ثم تاريخ البدء، ثم تاريخ النهاية، ثم الرمز البريدي، ثم أرفق الملفين."
+
+                # If user message seems to contain only a single field, switch to progressive mode directly
+                looks_single = bool(re.search(r"\b\d{5}\b", user_text) or re.search(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", user_text) or (len(user_text.split()) <= 4))
+                if looks_single or ("ligne" in user_text.lower()) or ("step" in user_text.lower()) or ("line" in user_text.lower()):
+                    SESSION_STATE[sid] = {"intent": prev_intent, "stage": "collect_details", "details": {"name": "", "start_date": "", "end_date": "", "postal_code": "", "attachments": saved_urls or []}}
                 return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=saved_urls or None)
 
-            SESSION_STATE.pop(sid, None)
-            msg = "Parfait — nous avons bien recu votre demande de location avec les informations et pieces jointes. Nous procedons a la reservation et revenons vers vous sous 24h." if lang == "fr" else ("Perfect — we received your rental request with all details and attachments. We'll proceed and get back within 24h." if lang == "en" else "ممتاز — لقد استلمنا طلب الاستئجار بكل البيانات والمرفقات. سنقوم بالإجراءات ونعود إليك خلال 24 ساعة.")
-            return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent)
+            # Extract a simple summary from the user's message
+            # Name: take first two words of the message as an approximation
+            words = [w for w in re.split(r"\s+", user_text.strip()) if w]
+            name_guess = " ".join(words[:2]) if len(words) >= 2 else ""
+            # Dates: take first 2 dd/mm/yyyy found
+            start_date, end_date = (dates_found[0], dates_found[1]) if len(dates_found) >= 2 else ("", "")
+            # Postal code
+            pc_match = re.search(r"\b\d{5}\b", user_text)
+            postal_code = pc_match.group(0) if pc_match else ""
+
+            summary = {
+                "name": name_guess,
+                "start_date": start_date,
+                "end_date": end_date,
+                "postal_code": postal_code,
+                "attachments": saved_urls,
+            }
+
+            # Store pending details and ask for confirmation
+            SESSION_STATE[sid] = {"intent": prev_intent, "stage": "confirm_summary", "details": summary}
+            if lang == "fr":
+                msg = (
+                    "Merci. Voici votre récapitulatif:\n"
+                    f"• Nom/Prénom: {summary['name']}\n"
+                    f"• Date début: {summary['start_date']}\n"
+                    f"• Date fin: {summary['end_date']}\n"
+                    f"• Code postal: {summary['postal_code']}\n"
+                    "• PJ: Ordonnance + Carte mutuelle\n\n"
+                    "Confirmer la commande ? (Oui / Non)"
+                )
+            elif lang == "en":
+                msg = (
+                    "Thanks. Here is your summary:\n"
+                    f"• Name: {summary['name']}\n"
+                    f"• Start date: {summary['start_date']}\n"
+                    f"• End date: {summary['end_date']}\n"
+                    f"• Postal code: {summary['postal_code']}\n"
+                    "• Attachments: Prescription + Insurance card\n\n"
+                    "Confirm order? (Yes / No)"
+                )
+            else:
+                msg = (
+                    "شكرًا. هذا الملخص:\n"
+                    f"• الاسم: {summary['name']}\n"
+                    f"• تاريخ البدء: {summary['start_date']}\n"
+                    f"• تاريخ النهاية: {summary['end_date']}\n"
+                    f"• الرمز البريدي: {summary['postal_code']}\n"
+                    "• المرفقات: الوصفة + بطاقة التأمين\n\n"
+                    "تأكيد الطلب؟ (نعم / لا)"
+                )
+            return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=saved_urls or None, confirm=True, summary=summary)
 
         if prev_intent == "return":
             lt = (user_text or "").lower()
@@ -380,15 +663,110 @@ async def chat(
 
     # Intent flow (start new intent if no ongoing state)
     if intent in {"rent", "renew", "return"}:
+        # Handle confirmation of summary if pending
+        if state.get("stage") == "confirm_summary":
+            prev_intent = state.get("intent")
+            if _is_affirmative(user_text):
+                SESSION_STATE.pop(sid, None)
+                msg = (
+                    "Parfait — nous avons bien recu votre demande de location avec les informations et pieces jointes. Nous procedons a la reservation et revenons vers vous sous 24h."
+                    if lang == "fr"
+                    else (
+                        "Perfect — we received your rental request with all details and attachments. We'll proceed and get back within 24h."
+                        if lang == "en"
+                        else "ممتاز — لقد استلمنا طلب الاستئجار بكل البيانات والمرفقات. سنقوم بالإجراءات ونعود إليك خلال 24 ساعة."
+                    )
+                )
+                return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent)
+            if _is_negative(user_text):
+                # Switch to edit mode in progressive collection with pre-filled details
+                current = state.get("details") or {"name": "", "start_date": "", "end_date": "", "postal_code": "", "attachments": []}
+                SESSION_STATE[sid] = {"intent": prev_intent, "stage": "collect_details", "details": current, "edit": True}
+                msg = (
+                    "D'accord. Quel champ souhaitez-vous corriger ?\nExemples: \n• Nom: Dupont Marie\n• Date début: 22/01/2026\n• Date fin: 29/01/2026\n• Code postal: 69001"
+                    if lang == "fr"
+                    else (
+                        "Okay. Which field would you like to edit?\nExamples:\n• Name: Doe Jane\n• Start date: 22/01/2026\n• End date: 29/01/2026\n• Postal code: 69001"
+                        if lang == "en"
+                        else "حسنًا. ما الحقل الذي تريد تعديله؟\nأمثلة:\n• الاسم: أحمد علي\n• تاريخ البدء: 22/01/2026\n• تاريخ النهاية: 29/01/2026\n• الرمز البريدي: 69001"
+                    )
+                )
+                return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=prev_intent, attachments=current.get("attachments") or None)
+
+            # Inline corrections while on the recap
+            current = state.get("details") or {"name": "", "start_date": "", "end_date": "", "postal_code": "", "attachments": []}
+            lt = (user_text or "").strip()
+            changed = False
+
+            def _apply_labeled_change_cs(patterns: list[str], key: str, parser=None):
+                nonlocal changed
+                for p in patterns:
+                    m = re.search(rf"(?i)\b{p}\b\s*:\s*(.+)", lt)
+                    if m:
+                        val = m.group(1).strip()
+                        if key in {"start_date", "end_date"}:
+                            ds = re.findall(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", val)
+                            if ds:
+                                current[key] = ds[0]
+                                changed = True
+                                return
+                        elif key == "postal_code":
+                            pc = re.search(r"\b\d{5}\b", val)
+                            if pc:
+                                current[key] = pc.group(0)
+                                changed = True
+                                return
+                        elif key == "name":
+                            nm = parser(val) if parser else val
+                            if nm:
+                                current[key] = nm
+                                changed = True
+                                return
+                        else:
+                            if val:
+                                current[key] = val
+                                changed = True
+                                return
+
+            def _parse_name_inline(t: str):
+                if "," in t:
+                    parts = [p.strip() for p in t.split(",") if p.strip()]
+                    if len(parts) >= 2:
+                        return f"{parts[0]} {parts[1]}"
+                parts = [p for p in re.split(r"\s+", t.strip()) if p]
+                if len(parts) >= 2 and len(" ".join(parts)) <= 80:
+                    return f"{parts[0]} {parts[1]}"
+                return ""
+
+            _apply_labeled_change_cs(["nom", "name", "الاسم"], "name", _parse_name_inline)
+            _apply_labeled_change_cs(["date début", "date debut", "start date", "تاريخ البدء"], "start_date")
+            _apply_labeled_change_cs(["date fin", "end date", "تاريخ النهاية"], "end_date")
+            _apply_labeled_change_cs(["code postal", "postal code", "الرمز البريدي"], "postal_code")
+
+            if changed:
+                summary = {
+                    "name": current.get("name", ""),
+                    "start_date": current.get("start_date", ""),
+                    "end_date": current.get("end_date", ""),
+                    "postal_code": current.get("postal_code", ""),
+                    "attachments": current.get("attachments", []),
+                }
+                SESSION_STATE[sid] = {"intent": prev_intent, "stage": "confirm_summary", "details": summary}
+                return ChatResponse(reply="", session_id=sid, lang=lang, intent=prev_intent, attachments=summary.get("attachments") or None, confirm=True, summary=summary)
+
         if state.get("stage") == "asked_confirm":
             if _is_affirmative(user_text):
-                SESSION_STATE[sid] = {"intent": intent, "stage": "awaiting_details"}
-                if intent == "rent":
-                    msg = "Merci de m'envoyer vos donnees en une seule reponse :\n\nNom, Prenom, Date debut (ex: 22/01/2026), Date fin (ex: 29/01/2026), Code postal\n\nEt les 2 fichiers a mettre (PDF ou image) : Ordonnance + Carte mutuelle" if lang == "fr" else ("Please send me your information in a single response:\n\nLast name, First name, Start date (e.g. 22/01/2026), End date (e.g. 29/01/2026), Postal code\n\nAnd the 2 files (PDF or image): Prescription + Insurance card" if lang == "en" else "يرجى إرسال معلوماتك في رد واحد:\n\nاللقب، الاسم الأول، تاريخ البدء (مثال: 22/01/2026)، تاريخ النهاية (مثال: 29/01/2026)، الرمز البريدي\n\nوالملفان (PDF أو صورة): الوصفة + بطاقة التأمين")
-                elif intent == "renew":
-                    msg = "Merci de m'envoyer vos donnees en une seule reponse :\n\nNom, Prenom, Date debut (ex: 22/01/2026), Date fin (ex: 29/01/2026), Code postal\n\nEt les 2 fichiers a mettre (PDF ou image) : Ordonnance + Carte mutuelle" if lang == "fr" else ("Please send me your information in a single response:\n\nLast name, First name, Start date (e.g. 22/01/2026), End date (e.g. 29/01/2026), Postal code\n\nAnd the 2 files (PDF or image): Prescription + Insurance card" if lang == "en" else "يرجى إرسال معلوماتك في رد واحد:\n\nاللقب، الاسم الأول، تاريخ البدء (مثال: 22/01/2026)، تاريخ النهاية (مثال: 29/01/2026)، الرمز البريدي\n\nوالملفان (PDF أو صورة): الوصفة + بطاقة التأمين")
-                else:
+                # Progressive collection directly
+                SESSION_STATE[sid] = {"intent": intent, "stage": "collect_details", "details": {"name": "", "start_date": "", "end_date": "", "postal_code": "", "attachments": []}}
+                if intent == "return":
                     msg = "Pour le retour, envoie votre reference de commande et la preuve d'envoi ou l'etiquette, et ajoute la photo si possible." if lang == "fr" else ("For the return, send your order reference and the shipping proof or label, and add a photo if possible." if lang == "en" else "لعملية الإرجاع، أرسل مرجع الطلب وإثبات الشحن أو الملصق، وأضف صورة إن أمكن.")
+                else:
+                    if lang == "fr":
+                        msg = "Merci. Indiquez Nom, Prénom (ex: Dupont, Marie)"
+                    elif lang == "en":
+                        msg = "Thanks. Please provide Last name, First name (e.g., Doe, Jane)"
+                    else:
+                        msg = "شكرًا. يرجى إرسال الاسم واللقب (مثال: أحمد، علي)"
                 return ChatResponse(reply=msg, session_id=sid, lang=lang, intent=intent, attachments=saved_urls or None)
             elif _is_negative(user_text):
                 SESSION_STATE.pop(sid, None)

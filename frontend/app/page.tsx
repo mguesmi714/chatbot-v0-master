@@ -124,22 +124,23 @@ function isRentalTrigger(text: string) {
 
 function assistantAsksAttachments(text: string) {
     const t = (text || "").toLowerCase();
+    // Detect explicit request for the two files just before confirmation
     // FR
-    const fr =
-        (t.includes("pièce jointe") || t.includes("pièces jointes")) &&
-        (t.includes("ordonnance") || t.includes("mutuelle") || t.includes("carte mutuelle"));
-    const frRental = t.includes("location") && (t.includes("ordonnance") || t.includes("mutuelle"));
+    const fr = (
+        t.includes("ajoutez les 2 pièces") ||
+        t.includes("ajoutez les deux pièces") ||
+        ((t.includes("ordonnance") || t.includes("carte mutuelle") || t.includes("mutuelle")) && (t.includes("ajoutez") || t.includes("merci d'")))
+    );
     // EN
-    const en =
-        (t.includes("attachment") || t.includes("attachments")) &&
-        (t.includes("prescription") || t.includes("insurance"));
-    const enRental = t.includes("rental") && (t.includes("prescription") || t.includes("insurance"));
+    const en = (
+        t.includes("attach both files") ||
+        ((t.includes("prescription") || t.includes("insurance")) && (t.includes("attach") || t.includes("please attach")))
+    );
     // AR
-    const ar =
-        (t.includes("مرفق") || t.includes("المرفقات")) &&
-        (t.includes("الوصفة") || t.includes("وصفة") || t.includes("بطاقة التأمين") || t.includes("التأمين"));
-    const arRental = t.includes("استئجار") && (t.includes("الوصفة") || t.includes("بطاقة التأمين"));
-    return fr || frRental || en || enRental || ar || arRental;
+    const ar = (
+        (t.includes("أرفق") || t.includes("يرجى إرفاق")) && (t.includes("الوصفة") || t.includes("بطاقة التأمين"))
+    );
+    return fr || en || ar;
 }
 
 export default function Page() {
@@ -240,8 +241,18 @@ export default function Page() {
     const [showAttachTip, setShowAttachTip] = useState(false);
     const [qaMode, setQaMode] = useState(false);
 
+    // Confirmation summary modal (after backend validates details)
+    const [confirmOpen, setConfirmOpen] = useState(false);
+    const [confirmSummary, setConfirmSummary] = useState<any | null>(null);
+    const [confirmEdit, setConfirmEdit] = useState(false);
+    const [editableSummary, setEditableSummary] = useState<any | null>(null);
+    // Show attachments only at the very end (just before confirmation)
+    const [awaitingFinalAttachments, setAwaitingFinalAttachments] = useState(false);
+
     const bottomRef = useRef<HTMLDivElement | null>(null);
     const textareaRef = useRef<HTMLTextAreaElement | null>(null);
+    // Ensure the message box stays ready to type without clicking each time
+    const focusComposer = () => requestAnimationFrame(() => textareaRef.current?.focus());
 
     useEffect(() => {
         const key = "tlx_session_id";
@@ -276,8 +287,12 @@ export default function Page() {
 
     async function sendMessage(textOverride?: string) {
         const text = (textOverride ?? input).trim();
-        if (!text || loading) return;
+        const hasAttachToSend = Boolean(prescriptionFile || insuranceFile);
+        if (loading) return;
         if (!sessionId) return;
+
+        // Allow sending when only attachments are provided (no text)
+        if (!text && !hasAttachToSend) return;
 
         // ✅ si l’utilisateur déclenche la location, on passe en rentalMode
         if (isRentalTrigger(text)) {
@@ -285,7 +300,7 @@ export default function Page() {
             setRentalMode(true);
         }
 
-        const userMsg: Msg = { role: "user", content: text };
+        const userMsg: Msg = { role: "user", content: text || (language === "en" ? "Documents uploaded" : language === "ar" ? "تم رفع المستندات" : "Documents envoyés") };
         const nextMessages = [...messages, userMsg];
 
         setMessages(nextMessages);
@@ -333,15 +348,30 @@ export default function Page() {
             }
 
             const assistantMsg: Msg = { role: "assistant", content: data.reply };
-            setMessages((prev) => [...prev, assistantMsg]);
 
-            // Show attachments bar ONLY after confirmation, and only for rent/renew
-            if (data.intent && ["rent", "renew"].includes(data.intent)) {
-                setAttachmentsVisible(true);
-                setAttachmentsOpen(true);
+            // Show the attachments bar only when the assistant explicitly asks for the two files (last step before confirmation)
+            const askForAttachments = assistantAsksAttachments(assistantMsg.content) || (!!data.attachments && Array.isArray(data.attachments) && (data.attachments.length || 0) < 2 && (data.intent && ["rent","renew"].includes(data.intent)));
+            setAttachmentsVisible(!!askForAttachments);
+            if (askForAttachments) setAttachmentsOpen(true); else setAttachmentsOpen(false);
+
+            // If backend asks for confirmation with a summary, open confirmation modal and avoid duplicating the recap in the chat feed
+            if (data.confirm) {
+                setConfirmSummary(data.summary || {});
+                setEditableSummary({
+                    name: data.summary?.name || "",
+                    start_date: data.summary?.start_date || "",
+                    end_date: data.summary?.end_date || "",
+                    postal_code: data.summary?.postal_code || "",
+                });
+                setConfirmEdit(false);
+                setConfirmOpen(true);
             } else {
-                setAttachmentsVisible(false);
-                setAttachmentsOpen(false);
+                // Only append assistant message when it's not a confirmation summary
+                setMessages((prev) => [...prev, assistantMsg]);
+                setConfirmOpen(false);
+                setConfirmSummary(null);
+                setEditableSummary(null);
+                setConfirmEdit(false);
             }
         } catch {
             setMessages((prev) => [
@@ -354,7 +384,51 @@ export default function Page() {
             ]);
         } finally {
             setLoading(false);
+            focusComposer();
         }
+    }
+
+    async function confirmOrder() {
+        // If user edited fields inline, first send labeled updates, then auto confirm
+        if (confirmEdit && editableSummary) {
+            const labels = language === "en"
+                ? { name: "Name", start: "Start date", end: "End date", pc: "Postal code" }
+                : language === "ar"
+                ? { name: "الاسم", start: "تاريخ البدء", end: "تاريخ النهاية", pc: "الرمز البريدي" }
+                : { name: "Nom", start: "Date début", end: "Date fin", pc: "Code postal" };
+
+            const lines = [
+                `${labels.name}: ${editableSummary.name || ""}`,
+                `${labels.start}: ${editableSummary.start_date || ""}`,
+                `${labels.end}: ${editableSummary.end_date || ""}`,
+                `${labels.pc}: ${editableSummary.postal_code || ""}`,
+            ].join("\n");
+
+            setConfirmOpen(false);
+            setAwaitingFinalAttachments(false);
+            await sendMessage(lines);
+            const yes = language === "en" ? "yes" : language === "ar" ? "نعم" : "oui";
+            await sendMessage(yes);
+            setConfirmSummary(null);
+            setEditableSummary(null);
+            setConfirmEdit(false);
+            return;
+        }
+        // Send a simple affirmative token based on language
+        const yes = language === "en" ? "yes" : language === "ar" ? "نعم" : "oui";
+        setConfirmOpen(false);
+        setConfirmSummary(null);
+        setEditableSummary(null);
+        setConfirmEdit(false);
+        setAwaitingFinalAttachments(false);
+        sendMessage(yes);
+        setTimeout(focusComposer, 50);
+    }
+
+    function cancelConfirm() {
+        // Toggle inline edit mode without sending a chat message
+        setConfirmEdit((v) => !v);
+        setTimeout(focusComposer, 50);
     }
 
     function askFAQ() {
@@ -366,6 +440,7 @@ export default function Page() {
         setAttachmentsOpen(false);
         setShowAttachTip(false);
         setMessages((prev) => [...prev, { role: "assistant", content: ui.qaPrompt }]);
+        setTimeout(focusComposer, 50);
     }
 
     async function applyLanguage(newLang: string) {
@@ -394,6 +469,7 @@ export default function Page() {
             const data = await res.json();
             if (data?.reply) setMessages((prev) => [...prev, { role: "assistant", content: data.reply }]);
         } catch {}
+        setTimeout(focusComposer, 50);
     }
 
     function clearChat() {
@@ -407,6 +483,8 @@ export default function Page() {
         setAttachmentsOpen(false);
         setShowAttachTip(false);
         setQaMode(false);
+        setAwaitingFinalAttachments(false);
+        setTimeout(focusComposer, 50);
     }
 
     function onTextareaKeyDown(e: React.KeyboardEvent<HTMLTextAreaElement>) {
@@ -599,8 +677,86 @@ export default function Page() {
                             <div ref={bottomRef} />
                         </div>
 
+                        {/* Confirmation Summary Modal */}
+                        <AnimatePresence>
+                            {confirmOpen && (
+                                <motion.div
+                                    initial={{ opacity: 0, y: 10 }}
+                                    animate={{ opacity: 1, y: 0 }}
+                                    exit={{ opacity: 0, y: 10 }}
+                                    transition={{ duration: 0.18 }}
+                                    className="absolute inset-0 bg-black/20 flex items-end justify-center p-4"
+                                    style={{ zIndex: 50 }}
+                                >
+                                    <div className="w-full rounded-2xl border shadow-xl p-4" style={{ background: "var(--surface)", borderColor: "var(--surface-border)" }}>
+                                        <div className="font-semibold mb-2" style={{ color: "var(--text-dark)" }}>
+                                            {language === "en" ? "Please confirm your order" : language === "ar" ? "يرجى تأكيد الطلب" : "Veuillez confirmer la commande"}
+                                        </div>
+                                        {confirmSummary && (
+                                            <div className="text-sm space-y-2" style={{ color: "var(--text-dark)" }}>
+                                                {!confirmEdit ? (
+                                                    <>
+                                                        {confirmSummary.name ? <div>• {language === "en" ? "Name" : language === "ar" ? "الاسم" : "Nom/Prénom"}: {confirmSummary.name}</div> : null}
+                                                        {confirmSummary.start_date ? <div>• {language === "en" ? "Start date" : language === "ar" ? "تاريخ البدء" : "Date début"}: {confirmSummary.start_date}</div> : null}
+                                                        {confirmSummary.end_date ? <div>• {language === "en" ? "End date" : language === "ar" ? "تاريخ النهاية" : "Date fin"}: {confirmSummary.end_date}</div> : null}
+                                                        {confirmSummary.postal_code ? <div>• {language === "en" ? "Postal code" : language === "ar" ? "الرمز البريدي" : "Code postal"}: {confirmSummary.postal_code}</div> : null}
+                                                        <div>• {language === "en" ? "Attachments" : language === "ar" ? "المرفقات" : "Pièces jointes"}: {filesCount}/2</div>
+                                                    </>
+                                                ) : (
+                                                    <div className="grid grid-cols-2 gap-2">
+                                                        <div className="col-span-2">
+                                                            <label className="text-xs" style={{ color: "var(--text-muted)" }}>{language === "en" ? "Name" : language === "ar" ? "الاسم" : "Nom/Prénom"}</label>
+                                                            <input className="w-full border rounded-xl px-3 py-2 text-sm" style={{ borderColor: "var(--surface-border)", background: "var(--surface-strong)", color: "var(--text-dark)" }}
+                                                                value={editableSummary?.name || ""}
+                                                                onChange={(e)=> setEditableSummary((s:any)=> ({...s, name: e.target.value}))}
+                                                            />
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-xs" style={{ color: "var(--text-muted)" }}>{language === "en" ? "Start date" : language === "ar" ? "تاريخ البدء" : "Date début"}</label>
+                                                            <input className="w-full border rounded-xl px-3 py-2 text-sm" style={{ borderColor: "var(--surface-border)", background: "var(--surface-strong)", color: "var(--text-dark)" }}
+                                                                value={editableSummary?.start_date || ""}
+                                                                onChange={(e)=> setEditableSummary((s:any)=> ({...s, start_date: e.target.value}))}
+                                                                placeholder="22/01/2026"
+                                                            />
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-xs" style={{ color: "var(--text-muted)" }}>{language === "en" ? "End date" : language === "ar" ? "تاريخ النهاية" : "Date fin"}</label>
+                                                            <input className="w-full border rounded-xl px-3 py-2 text-sm" style={{ borderColor: "var(--surface-border)", background: "var(--surface-strong)", color: "var(--text-dark)" }}
+                                                                value={editableSummary?.end_date || ""}
+                                                                onChange={(e)=> setEditableSummary((s:any)=> ({...s, end_date: e.target.value}))}
+                                                                placeholder="29/01/2026"
+                                                            />
+                                                        </div>
+                                                        <div>
+                                                            <label className="text-xs" style={{ color: "var(--text-muted)" }}>{language === "en" ? "Postal code" : language === "ar" ? "الرمز البريدي" : "Code postal"}</label>
+                                                            <input className="w-full border rounded-xl px-3 py-2 text-sm" style={{ borderColor: "var(--surface-border)", background: "var(--surface-strong)", color: "var(--text-dark)" }}
+                                                                value={editableSummary?.postal_code || ""}
+                                                                onChange={(e)=> setEditableSummary((s:any)=> ({...s, postal_code: e.target.value}))}
+                                                                placeholder="69001"
+                                                            />
+                                                        </div>
+                                                        <div className="col-span-2 text-[11px]" style={{ color: "var(--text-muted)" }}>
+                                                            {language === "en" ? "Edit the fields then confirm." : language === "ar" ? "عدّل الحقول ثم أكد." : "Modifiez les champs puis confirmez."}
+                                                        </div>
+                                                    </div>
+                                                )}
+                                            </div>
+                                        )}
+                                        <div className="mt-3 flex justify-end gap-2">
+                                            <button onClick={cancelConfirm} className="px-3 py-1.5 rounded-full text-sm border" style={{ background: "var(--surface)", borderColor: "var(--surface-border)", color: "var(--text-dark)" }}>
+                                                {confirmEdit ? (language === "en" ? "Done" : language === "ar" ? "تم" : "Terminer") : (language === "en" ? "Edit" : language === "ar" ? "تعديل" : "Modifier")}
+                                            </button>
+                                            <button onClick={confirmOrder} className="px-3 py-1.5 rounded-full text-sm text-white" style={{ background: "var(--chat-user-bubble)" }}>
+                                                {language === "en" ? "Confirm" : language === "ar" ? "تأكيد" : "Confirmer"}
+                                            </button>
+                                        </div>
+                                    </div>
+                                </motion.div>
+                            )}
+                        </AnimatePresence>
+
                         {/* Quick actions */}
-                        <div className="px-4 py-2 border-t flex gap-2 overflow-x-auto" style={{ background: "var(--surface)", borderColor: "var(--surface-border)" }}>
+                        <div className="px-4 py-2 border-t flex gap-2 overflow-x-auto" style={{ background: "var(--surface)", borderColor: "var(--surface-border)", pointerEvents: confirmOpen ? "none" : "auto", opacity: confirmOpen ? 0.6 : 1 }}>
                             {/* Quick buttons */}
                             {ui.quick.map((label) => (
                                 <button
@@ -640,11 +796,11 @@ export default function Page() {
 
                         {/* ✅ PJ uniquement si nécessaire */}
                         {attachmentsVisible && (
-                            <div className="px-4 py-2 border-t" style={{ background: "var(--surface)", borderColor: "var(--surface-border)" }}>
+                            <div className="px-4 py-2 border-t" style={{ background: "var(--surface)", borderColor: "var(--surface-border)", pointerEvents: confirmOpen ? "none" : "auto", opacity: confirmOpen ? 0.6 : 1 }}>
                                 <div className="flex items-center justify-between gap-2">
                                     <button
                                         type="button"
-                                        onClick={() => setAttachmentsOpen((v) => !v)}
+                                        onClick={() => { setAttachmentsOpen((v) => !v); setTimeout(focusComposer, 50); }}
                                         className="flex items-center gap-2 text-xs font-semibold"
                                         style={{ color: "var(--text-dark)" }}
                                         title="Afficher / masquer les pièces jointes"
@@ -754,7 +910,7 @@ export default function Page() {
                         )}
 
                         {/* Input */}
-                        <div className="p-3 border-t flex gap-2" style={{ background: "var(--surface)", borderColor: "var(--surface-border)" }}>
+                        <div className="p-3 border-t flex gap-2" style={{ background: "var(--surface)", borderColor: "var(--surface-border)", pointerEvents: confirmOpen ? "none" : "auto", opacity: confirmOpen ? 0.6 : 1 }}>
                             <div className="flex-1 relative">
                 <textarea
                     ref={textareaRef}

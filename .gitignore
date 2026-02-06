@@ -1,4 +1,21 @@
-# --- OS ---
+# Node/Next.js
+node_modules/
+.next/
+*.log
+
+# Python
+**/__pycache__/
+*.pyc
+.venv/
+
+# Backend uploads (runtime artifacts)
+backend/uploads/
+
+# Env and OS
+.env*
+*.env
+.DS_Store
+Thumbs.db# --- OS ---
 .DS_Store
 Thumbs.db
 
